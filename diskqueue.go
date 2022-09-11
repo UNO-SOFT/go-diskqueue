@@ -9,7 +9,7 @@ import (
 	"io"
 	"math/rand"
 	"os"
-	"path"
+	"path/filepath"
 	"sync"
 	"time"
 )
@@ -68,14 +68,8 @@ type diskQueue struct {
 	sync.RWMutex
 
 	// instantiation time metadata
-	name                string
-	dataPath            string
-	maxBytesPerFile     int64 // cannot change once created
+	cfg                 Config
 	maxBytesPerFileRead int64
-	minMsgSize          int32
-	maxMsgSize          int32
-	syncEvery           int64         // number of writes per fsync
-	syncTimeout         time.Duration // duration of time per fsync
 	exitFlag            int32
 	needSync            bool
 
@@ -103,21 +97,20 @@ type diskQueue struct {
 	emptyResponseChan chan error
 	exitChan          chan int
 	exitSyncChan      chan int
-
-	logf AppLogFunc
 }
 
-// New instantiates an instance of diskQueue, retrieving metadata
-// from the filesystem and starting the read ahead goroutine
-func New(name string, dataPath string, maxBytesPerFile int64,
-	minMsgSize int32, maxMsgSize int32,
-	syncEvery int64, syncTimeout time.Duration, logf AppLogFunc) Interface {
+type Config struct {
+	Name, DataPath         string
+	MaxBytesPerFile        int64
+	MinMsgSize, MaxMsgSize int32
+	SyncEvery              int64
+	SyncTimeout            time.Duration
+	Logf                   AppLogFunc
+}
+
+func (cfg Config) New() Interface {
 	d := diskQueue{
-		name:              name,
-		dataPath:          dataPath,
-		maxBytesPerFile:   maxBytesPerFile,
-		minMsgSize:        minMsgSize,
-		maxMsgSize:        maxMsgSize,
+		cfg:               cfg,
 		readChan:          make(chan []byte),
 		peekChan:          make(chan []byte),
 		depthChan:         make(chan int64),
@@ -127,19 +120,30 @@ func New(name string, dataPath string, maxBytesPerFile int64,
 		emptyResponseChan: make(chan error),
 		exitChan:          make(chan int),
 		exitSyncChan:      make(chan int),
-		syncEvery:         syncEvery,
-		syncTimeout:       syncTimeout,
-		logf:              logf,
 	}
 
 	// no need to lock here, nothing else could possibly be touching this instance
 	err := d.retrieveMetaData()
 	if err != nil && !os.IsNotExist(err) {
-		d.logf(ERROR, "DISKQUEUE(%s) failed to retrieveMetaData - %s", d.name, err)
+		d.logf(ERROR, "DISKQUEUE(%s) failed to retrieveMetaData - %s", d.cfg.Name, err)
 	}
 
 	go d.ioLoop()
 	return &d
+}
+
+// New instantiates an instance of diskQueue, retrieving metadata
+// from the filesystem and starting the read ahead goroutine
+func New(name string, dataPath string, maxBytesPerFile int64,
+	minMsgSize int32, maxMsgSize int32,
+	syncEvery int64, syncTimeout time.Duration, logf AppLogFunc,
+) Interface {
+	return Config{
+		Name: name, DataPath: dataPath, MaxBytesPerFile: maxBytesPerFile,
+		MinMsgSize: minMsgSize, MaxMsgSize: maxMsgSize,
+		SyncEvery: syncEvery, SyncTimeout: syncTimeout,
+		Logf: logf,
+	}.New()
 }
 
 // Depth returns the depth of the queue
@@ -194,9 +198,9 @@ func (d *diskQueue) exit(deleted bool) error {
 	d.exitFlag = 1
 
 	if deleted {
-		d.logf(INFO, "DISKQUEUE(%s): deleting", d.name)
+		d.logf(INFO, "DISKQUEUE(%s): deleting", d.cfg.Name)
 	} else {
-		d.logf(INFO, "DISKQUEUE(%s): closing", d.name)
+		d.logf(INFO, "DISKQUEUE(%s): closing", d.cfg.Name)
 	}
 
 	close(d.exitChan)
@@ -228,7 +232,7 @@ func (d *diskQueue) Empty() error {
 		return errors.New("exiting")
 	}
 
-	d.logf(INFO, "DISKQUEUE(%s): emptying", d.name)
+	d.logf(INFO, "DISKQUEUE(%s): emptying", d.cfg.Name)
 
 	d.emptyChan <- 1
 	return <-d.emptyResponseChan
@@ -239,7 +243,7 @@ func (d *diskQueue) deleteAllFiles() error {
 
 	innerErr := os.Remove(d.metaDataFileName())
 	if innerErr != nil && !os.IsNotExist(innerErr) {
-		d.logf(ERROR, "DISKQUEUE(%s) failed to remove metadata file - %s", d.name, innerErr)
+		d.logf(ERROR, "DISKQUEUE(%s) failed to remove metadata file - %s", d.cfg.Name, innerErr)
 		return innerErr
 	}
 
@@ -263,7 +267,7 @@ func (d *diskQueue) skipToNextRWFile() error {
 		fn := d.fileName(i)
 		innerErr := os.Remove(fn)
 		if innerErr != nil && !os.IsNotExist(innerErr) {
-			d.logf(ERROR, "DISKQUEUE(%s) failed to remove data file - %s", d.name, innerErr)
+			d.logf(ERROR, "DISKQUEUE(%s) failed to remove data file - %s", d.cfg.Name, innerErr)
 			err = innerErr
 		}
 	}
@@ -292,7 +296,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 			return nil, err
 		}
 
-		d.logf(INFO, "DISKQUEUE(%s): readOne() opened %s", d.name, curFileName)
+		d.logf(INFO, "DISKQUEUE(%s): readOne() opened %s", d.cfg.Name, curFileName)
 
 		if d.readPos > 0 {
 			_, err = d.readFile.Seek(d.readPos, 0)
@@ -305,7 +309,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 
 		// for "complete" files (i.e. not the "current" file), maxBytesPerFileRead
 		// should be initialized to the file's size, or default to maxBytesPerFile
-		d.maxBytesPerFileRead = d.maxBytesPerFile
+		d.maxBytesPerFileRead = d.cfg.MaxBytesPerFile
 		if d.readFileNum < d.writeFileNum {
 			stat, err := d.readFile.Stat()
 			if err == nil {
@@ -323,7 +327,7 @@ func (d *diskQueue) readOne() ([]byte, error) {
 		return nil, err
 	}
 
-	if msgSize < d.minMsgSize || msgSize > d.maxMsgSize {
+	if msgSize < d.cfg.MinMsgSize || msgSize > d.cfg.MaxMsgSize {
 		// this file is corrupt and we have no reasonable guarantee on
 		// where a new message should begin
 		d.readFile.Close()
@@ -370,12 +374,12 @@ func (d *diskQueue) writeOne(data []byte) error {
 	dataLen := int32(len(data))
 	totalBytes := int64(4 + dataLen)
 
-	if dataLen < d.minMsgSize || dataLen > d.maxMsgSize {
-		return fmt.Errorf("invalid message write size (%d) minMsgSize=%d maxMsgSize=%d", dataLen, d.minMsgSize, d.maxMsgSize)
+	if dataLen < d.cfg.MinMsgSize || dataLen > d.cfg.MaxMsgSize {
+		return fmt.Errorf("invalid message write size (%d) minMsgSize=%d maxMsgSize=%d", dataLen, d.cfg.MinMsgSize, d.cfg.MaxMsgSize)
 	}
 
 	// will not wrap-around if maxBytesPerFile + maxMsgSize < Int64Max
-	if d.writePos > 0 && d.writePos+totalBytes > d.maxBytesPerFile {
+	if d.writePos > 0 && d.writePos+totalBytes > d.cfg.MaxBytesPerFile {
 		if d.readFileNum == d.writeFileNum {
 			d.maxBytesPerFileRead = d.writePos
 		}
@@ -386,7 +390,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 		// sync every time we start writing to a new file
 		err = d.sync()
 		if err != nil {
-			d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.name, err)
+			d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.cfg.Name, err)
 		}
 
 		if d.writeFile != nil {
@@ -401,7 +405,7 @@ func (d *diskQueue) writeOne(data []byte) error {
 			return err
 		}
 
-		d.logf(INFO, "DISKQUEUE(%s): writeOne() opened %s", d.name, curFileName)
+		d.logf(INFO, "DISKQUEUE(%s): writeOne() opened %s", d.cfg.Name, curFileName)
 
 		if d.writePos > 0 {
 			_, err = d.writeFile.Seek(d.writePos, 0)
@@ -496,7 +500,7 @@ func (d *diskQueue) retrieveMetaData() error {
 	if d.writePos < fileSize {
 		d.logf(WARN,
 			"DISKQUEUE(%s) %s metadata writePos %d < file size of %d, skipping to new file",
-			d.name, fileName, d.writePos, fileSize)
+			d.cfg.Name, fileName, d.writePos, fileSize)
 		d.writeFileNum += 1
 		d.writePos = 0
 		if d.writeFile != nil {
@@ -538,11 +542,11 @@ func (d *diskQueue) persistMetaData() error {
 }
 
 func (d *diskQueue) metaDataFileName() string {
-	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.meta.dat"), d.name)
+	return fmt.Sprintf(filepath.Join(d.cfg.DataPath, "%s.diskqueue.meta.dat"), d.cfg.Name)
 }
 
 func (d *diskQueue) fileName(fileNum int64) string {
-	return fmt.Sprintf(path.Join(d.dataPath, "%s.diskqueue.%06d.dat"), d.name, fileNum)
+	return fmt.Sprintf(filepath.Join(d.cfg.DataPath, "%s.diskqueue.%06d.dat"), d.cfg.Name, fileNum)
 }
 
 func (d *diskQueue) checkTailCorruption(depth int64) {
@@ -556,11 +560,11 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 		if depth < 0 {
 			d.logf(ERROR,
 				"DISKQUEUE(%s) negative depth at tail (%d), metadata corruption, resetting 0...",
-				d.name, depth)
+				d.cfg.Name, depth)
 		} else if depth > 0 {
 			d.logf(ERROR,
 				"DISKQUEUE(%s) positive depth at tail (%d), data loss, resetting 0...",
-				d.name, depth)
+				d.cfg.Name, depth)
 		}
 		// force set depth 0
 		d.depth = 0
@@ -571,13 +575,13 @@ func (d *diskQueue) checkTailCorruption(depth int64) {
 		if d.readFileNum > d.writeFileNum {
 			d.logf(ERROR,
 				"DISKQUEUE(%s) readFileNum > writeFileNum (%d > %d), corruption, skipping to next writeFileNum and resetting 0...",
-				d.name, d.readFileNum, d.writeFileNum)
+				d.cfg.Name, d.readFileNum, d.writeFileNum)
 		}
 
 		if d.readPos > d.writePos {
 			d.logf(ERROR,
 				"DISKQUEUE(%s) readPos > writePos (%d > %d), corruption, skipping to next writeFileNum and resetting 0...",
-				d.name, d.readPos, d.writePos)
+				d.cfg.Name, d.readPos, d.writePos)
 		}
 
 		d.skipToNextRWFile()
@@ -599,7 +603,7 @@ func (d *diskQueue) moveForward() {
 		fn := d.fileName(oldReadFileNum)
 		err := os.Remove(fn)
 		if err != nil {
-			d.logf(ERROR, "DISKQUEUE(%s) failed to Remove(%s) - %s", d.name, fn, err)
+			d.logf(ERROR, "DISKQUEUE(%s) failed to Remove(%s) - %s", d.cfg.Name, fn, err)
 		}
 	}
 
@@ -624,13 +628,13 @@ func (d *diskQueue) handleReadError() {
 
 	d.logf(WARN,
 		"DISKQUEUE(%s) jump to next file and saving bad file as %s",
-		d.name, badRenameFn)
+		d.cfg.Name, badRenameFn)
 
 	err := os.Rename(badFn, badRenameFn)
 	if err != nil {
 		d.logf(ERROR,
 			"DISKQUEUE(%s) failed to rename bad diskqueue file %s to %s",
-			d.name, badFn, badRenameFn)
+			d.cfg.Name, badFn, badRenameFn)
 	}
 
 	d.readFileNum++
@@ -659,18 +663,18 @@ func (d *diskQueue) ioLoop() {
 	var r chan []byte
 	var p chan []byte
 
-	syncTicker := time.NewTicker(d.syncTimeout)
+	syncTicker := time.NewTicker(d.cfg.SyncTimeout)
 
 	for {
 		// dont sync all the time :)
-		if count == d.syncEvery {
+		if count == d.cfg.SyncEvery {
 			d.needSync = true
 		}
 
 		if d.needSync {
 			err = d.sync()
 			if err != nil {
-				d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.name, err)
+				d.logf(ERROR, "DISKQUEUE(%s) failed to sync - %s", d.cfg.Name, err)
 			}
 			count = 0
 		}
@@ -680,7 +684,7 @@ func (d *diskQueue) ioLoop() {
 				dataRead, err = d.readOne()
 				if err != nil {
 					d.logf(ERROR, "DISKQUEUE(%s) reading at %d of %s - %s",
-						d.name, d.readPos, d.fileName(d.readFileNum), err)
+						d.cfg.Name, d.readPos, d.fileName(d.readFileNum), err)
 					d.handleReadError()
 					continue
 				}
@@ -719,7 +723,11 @@ func (d *diskQueue) ioLoop() {
 	}
 
 exit:
-	d.logf(INFO, "DISKQUEUE(%s): closing ... ioLoop", d.name)
+	d.logf(INFO, "DISKQUEUE(%s): closing ... ioLoop", d.cfg.Name)
 	syncTicker.Stop()
 	d.exitSyncChan <- 1
+}
+
+func (d *diskQueue) logf(lvl LogLevel, f string, args ...interface{}) {
+	d.cfg.Logf(lvl, f, args...)
 }

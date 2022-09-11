@@ -1,3 +1,3 @@
-module github.com/nsqio/go-diskqueue
+module github.com/UNO-SOFT/go-diskqueue
 
-go 1.13
+go 1.17
